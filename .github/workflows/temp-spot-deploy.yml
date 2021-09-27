@@ -1,0 +1,171 @@
+name: Temporary deploy to AWS EC2 Spot instance
+
+on:
+  # TODO: Trigger - labeling an open Pull Request to merge to a staging branch
+  push:
+    branches:
+      - main
+
+env:
+  # All a string type
+  AWS_REGION_NAME: eu-north-1
+  AWS_ACCOUNT: "559014469485"
+  AWS_LAUNCH_TEMPLATE_ID: lt-0cb30c7a476cb212a
+  AWS_LAUNCH_TEMPLATE_VERSION: "3"
+  AWS_SPOT_MAX_PRICE_PER_HOUR: "0.02"
+  LIVE_MINUTES: "180"
+
+jobs:
+  job-a:
+    runs-on: ubuntu-latest
+    name: A job to request an instance and build and deploy on it
+    # FIXME: Does not work for me. 
+    # I use steps output. It's bad because we cannot split async jobs for process optimization
+    outputs:
+      instance_id: unknown
+      instance_private_ip: unknown
+      instance_public_ip: unknown
+      cron_expression: unknown
+    steps:
+      - uses: actions/checkout@v1
+      
+      - name: Install Node.js
+        uses: actions/setup-node@v1
+        with:
+          node-version: '10.x'
+
+      - name: Setup python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_NAME }}
+
+      - name: Get datetime to use in a spot termination trigger
+        id: get-date
+        # TODO: USE ${{ env.LIVE_MINUTES }}
+        run: echo "::set-output name=cron_expression::$(date -d'+180 minutes' +'%M %H %d %m ? %Y')"
+
+      - name: Request and configure and launch a EC2 Spot Instance
+        id: get-token
+        run: |
+          q="import sys, json; load = json.load(sys.stdin); print(load['Instances'][0]['InstanceId']); print(load['Instances'][0]['PrivateIpAddress'])"
+
+          c="import sys, json
+          try:
+            print(json.load(sys.stdin)['InstanceStatuses'][0]['InstanceState']['Name'])
+          except:
+            print(-1)"
+
+          region=${{ env.AWS_REGION_NAME }}
+          account=${{ env.AWS_ACCOUNT }}
+
+          launch_template_id=${{ env.AWS_LAUNCH_TEMPLATE_ID }}
+          launch_template_version=${{ env.AWS_LAUNCH_TEMPLATE_VERSION }}
+          max_price=${{ env.AWS_SPOT_MAX_PRICE_PER_HOUR }}
+
+          termination_role_name="AWS_Events_Invoke_Action_On_EC2_Instance_2069586255"
+
+          # TODO: Check that AMI includes the Node js preinstallation
+          instance_data=($(aws ec2 run-instances \
+              --image-id ami-0f0b4cb72cf3eadf3 \
+              --instance-type t3.micro \
+              --count 1 \
+              --launch-template "{ \
+                  \"LaunchTemplateId\": \"$launch_template_id\", \
+                  \"Version\": \"$launch_template_version\" \
+              }" \
+              --instance-market-options "{ \
+                  \"MarketType\": \"spot\", \
+                  \"SpotOptions\": {\
+                      \"MaxPrice\": \"$max_price\", \
+                      \"SpotInstanceType\": \"one-time\" \
+                  }\
+              }" \
+              --tag-specifications 'ResourceType=instance,Tags=[{Key=webserver,Value=temporary}]' |
+              python -c "$q"))
+
+          instance_id=${instance_data[0]}
+          instance_private_ip=${instance_data[1]}
+          echo "Spot Instance id: ${instance_data[0]}"
+          echo "Spot Instance IP: ${instance_data[1]}"
+
+          t=1
+          x='unknown'
+          while [ $x != "running" ] && [ $t -le 5 ]; do
+              sleep 5s
+              x=$(aws ec2 describe-instance-status --instance-id $instance_id | python -c "$c")
+              echo "Try #$t Status $x"
+              t=$(($t + 1))
+          done
+          echo "Done: Status $x"
+
+          # instance_id="i-0aa27a1388f0d08d2"
+          ## Register event that terminate spot instance
+
+          # FIXME: use 'steps.get-date.outputs.cron_expression' here
+          aws events put-rule --schedule-expression "cron(30 22 15 09 ? 2021)" --name "MyRule-$instance_id"
+
+          ## Attach spot instance target
+          aws events put-targets \
+              --rule "MyRule-$instance_id" \
+              --targets "[{ \
+                  \"Arn\": \"arn:aws:events:$region:$account:target/terminate-instance\", \
+                  \"RoleArn\": \"arn:aws:iam::$account:role/service-role/$termination_role_name\", \
+                  \"Id\": \"Target1\", \
+                  \"Input\": \"\\\"$instance_id\\\"\" \
+              }]"
+          
+          # FIXME: global outputs does not work
+          echo "::set-output name=instance_id::$instance_id"
+          echo "::set-output name=instance_private_ip::$instance_private_ip"
+
+      - name: Define public IP
+        id: get-ip
+        run: |
+          instance_id=${{ steps.get-token.outputs.instance_id }}
+          instance_public_ip=$(aws ec2 describe-instances \
+              --filter "Name=instance-id,Values=$instance_id" \
+              --query "Reservations[*].Instances[*].PublicIpAddress" \
+              --output=text)
+
+          echo "Spot Instance Public IP: ${instance_public_ip}"
+                
+          echo "::set-output name=instance_public_ip::$instance_public_ip"
+
+      - name: Check Instance ID
+        run: echo ${{ steps.get-token.outputs.instance_id }}
+      - name: Check Instance IP
+        run: echo ${{ steps.get-ip.outputs.instance_public_ip }}
+      - name: Check cron time
+        run: echo ${{ steps.get-date.outputs.cron_expression }}
+
+      # - name: Install npm dependencies
+      #   run: npm ci --only=production
+
+      - name: Run build task
+        run: npm run build --if-present
+
+      - name: Deploy to Temprorary server
+        uses: easingthemes/ssh-deploy@main
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SOURCE: "dist/"
+          REMOTE_HOST: ${{ steps.get-ip.outputs.instance_public_ip }}
+          REMOTE_USER: ec2-user
+          TARGET: "/daslab-api-temp/"
+
+      - name: Write PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          # FIXME: Human friendly time format is needed
+          message: |
+            #### Pull request was deployed on a temporary spot instance!
+            It's available for testing on [https://${{ steps.get-token.outputs.instance_public_ip }}/)
+            Remove label `Temporary deploy` to delete a temporary spot instance. 
+            Or the spot will automatical terminate at ${{ steps.get-token.outputs.cron_expression }}

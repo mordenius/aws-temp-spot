@@ -1,13 +1,22 @@
 {
   "name": "aws-spot-deploy",
   "version": "0.0.1",
-  "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "mkdir dist && mv index.js ./dist/index.js",
     "start": "node index.js"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mordenius/aws-temp-spot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mordenius/aws-temp-spot/issues"
+  },
+  "homepage": "https://github.com/mordenius/aws-temp-spot#readme",
+  "description": ""
 }
